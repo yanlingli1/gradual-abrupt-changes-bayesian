@@ -1,0 +1,44 @@
+model{
+for (pp in 1:P) {
+
+int[pp,1] ~ dnorm(0, 1)
+Y[pp,1] ~ dnorm(0, 1)
+beta0[pp] ~ dnorm(beta00, tau_beta0)
+beta1[pp] ~ dnorm(beta10, tau_beta1)
+
+
+# from T2 to maxT[pp]
+ for (bb in 1:nrPeriod){
+    
+   intercept[pp,bb] = beta0[pp] + beta1[pp]*time[bb]
+    
+   for(tt in (nrObs[bb]+1):nrObs[bb+1]){
+     int[pp,tt] ~ dnorm(intercept[pp,bb], tau_int)
+     mus[pp,tt] <- int[pp,tt] + AR * (Y[pp,tt-1] - int[pp,tt-1]) 
+	 Y[pp,tt] ~ dnorm(mus[pp,tt], tau_noise)
+
+} # close loop over time points
+
+}
+
+} # close loop over persons
+
+# priors
+AR ~ dnorm(0, 1)T(-1,1)
+tau_noise ~ dgamma(0.001,0.001)
+sd_noise = pow(tau_noise, -1/2)
+
+beta00 ~ dnorm(0, 0.01)
+#beta1 ~ dnorm(0, 1)
+tau_beta0 ~ dgamma(0.001,0.001)
+sd_beta0 = pow(tau_beta0, -1/2)
+beta10 ~ dnorm(0, 0.01)
+tau_beta1 ~ dgamma(0.001,0.001)
+sd_beta1 = pow(tau_beta1, -1/2)
+
+tau_int ~ dgamma(0.001,0.001)
+sd_int = pow(tau_int, -1/2)
+
+
+} # end of model
+

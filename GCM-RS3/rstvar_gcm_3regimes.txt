@@ -1,0 +1,99 @@
+model{
+for (pp in 1:P) {
+
+## odds: tansition probability matrices 
+## midx: regime indicators
+
+# 1st observation
+odds[pp,1,1] <- 0.8
+odds[pp,1,2] <- 0.1
+odds[pp,1,3] <- 0.1
+
+midx[pp,1]~dcat(odds[pp,1,])
+
+Y[pp,1] ~ dnorm(0, 1)
+beta0[pp] ~ dnorm(beta00, tau_beta0)
+beta1[pp] ~ dnorm(beta10, tau_beta1)
+AR[pp] ~ dnorm(AR0, tau_AR)T(-1,1)
+sd_noise[pp] ~ dnorm(sd_noise0, tau_sd_noise)
+tau_noise[pp] = pow(sd_noise[pp], -2)
+gamma[1,pp] = 0
+gamma[2,pp] ~ dnorm(gamma0[2], tau_gamma[2])
+gamma[3,pp] ~ dnorm(gamma0[3], tau_gamma[3])
+
+# from T2 to maxT[pp]
+ for (bb in 1:nrPeriod){
+    
+   intercept[pp,bb] = beta0[pp] + beta1[pp]*time[bb]
+   #intercept[pp,bb] ~ dnorm(mu_int[pp,bb], tau_int)
+    
+   for(tt in (nrObs[bb]+1):nrObs[bb+1]){
+      	    
+
+# from regime midx[pp,tt-1] to regime 1
+odds[pp,tt,1] <- exp(alpha[1,1,midx[pp,tt-1]])
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,2] <- exp(alpha[1,2,midx[pp,tt-1]])
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,3] <- exp(alpha[1,3,midx[pp,tt-1]])
+
+midx[pp,tt]~dcat(odds[pp,tt,])
+
+mus[pp,tt] <- gamma[midx[pp,tt],pp] + intercept[pp,bb] + AR[pp] * (Y[pp,tt-1] - intercept[pp,bb] - gamma[midx[pp,tt-1],pp]) 
+
+Y[pp,tt] ~ dnorm(mus[pp,tt], tau_noise[pp])
+
+
+} # close loop over time points
+
+}
+
+} # close loop over persons
+
+# priors
+gamma0[2] ~ dnorm(0, 0.01)T(0,)
+#gamma0[3] ~ dnorm(0, 0.01)T(gamma0[2],)
+gamma0[3] = gamma0[2] + diff23
+diff23 ~ dunif(0,15)
+tau_gamma[2] ~ dgamma(0.001,0.001)
+sd_gamma[2] = pow(tau_gamma[2], -1/2)
+tau_gamma[3] ~ dgamma(0.001,0.001)
+sd_gamma[3] = pow(tau_gamma[3], -1/2)
+
+#AR ~ dnorm(0, 1)T(-1,1)
+#tau_noise ~ dgamma(0.001,0.001)
+#sd_noise = pow(tau_noise, -1/2)
+AR0 ~ dnorm(0,1)T(-1,1)
+sd_AR ~ dunif(0, 1)
+tau_AR = pow(sd_AR, -2)
+
+sd_noise0 ~ dunif(0, 1)
+sd_sd_noise ~ dunif(0, 1)
+tau_sd_noise = pow(sd_sd_noise, -2)
+
+beta00 ~ dnorm(0, 0.01)
+#beta1 ~ dnorm(0, 1)
+tau_beta0 ~ dgamma(0.001,0.001)
+sd_beta0 = pow(tau_beta0, -1/2)
+beta10 ~ dnorm(0, 0.01)
+tau_beta1 ~ dgamma(0.001,0.001)
+sd_beta1 = pow(tau_beta1, -1/2)
+
+#tau_int ~ dgamma(0.001,0.001)
+#sd_int = pow(tau_int, -1/2)
+
+for(kk in 1:1){
+  alpha[kk,1,1] <- 0
+  alpha[kk,1,2] ~ dnorm(0,0.1)
+  alpha[kk,1,3] ~ dnorm(0,0.1)
+  alpha[kk,2,1] ~ dnorm(0,0.1)
+  alpha[kk,2,2] <- 0
+  alpha[kk,2,3] ~ dnorm(0,0.1)
+  alpha[kk,3,1] ~ dnorm(0,0.1)
+  alpha[kk,3,2] ~ dnorm(0,0.1)
+  alpha[kk,3,3] <- 0
+}
+
+
+} # end of model
+

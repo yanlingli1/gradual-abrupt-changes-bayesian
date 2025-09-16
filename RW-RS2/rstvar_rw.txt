@@ -1,0 +1,66 @@
+
+model{
+for (pp in 1:P) {
+
+## odds: tansition probability matrices 
+## midx: regime indicators
+
+# 1st observation
+odds[pp,1,1] <- 0.9
+odds[pp,1,2] <- 0.1
+
+midx[pp,1]~dcat(odds[pp,1,])
+
+Y[pp,1] ~ dnorm(0, 1)
+gamma[1,pp] = 0
+gamma[2,pp] ~ dnorm(gamma0[2], tau_gamma)
+int[pp,1] ~ dnorm(beta00, tau_beta0)
+
+# from T2 to maxT[pp]
+ for (tt in 2:maxT){
+    
+# from regime midx[pp,tt-1] to regime 1
+odds[pp,tt,1] <- exp(alpha[1,1,midx[pp,tt-1]]+alpha[2,1,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,2] <- exp(alpha[1,2,midx[pp,tt-1]]+alpha[2,2,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+
+midx[pp,tt]~dcat(odds[pp,tt,])
+
+int[pp,tt] ~ dnorm(int[pp,tt-1], tau_int) 
+mus[pp,tt] <- gamma[midx[pp,tt],pp] + int[pp,tt] + AR * (Y[pp,tt-1] - int[pp,tt-1] - gamma[midx[pp,tt-1],pp]) 
+
+Y[pp,tt] ~ dnorm(mus[pp,tt], tau_noise)
+
+
+} # close loop over time points
+
+
+} # close loop over persons
+
+# priors
+gamma0[2] ~ dnorm(0, 0.01)
+tau_gamma ~ dgamma(0.001,0.001)
+sd_gamma = pow(tau_gamma, -1/2)
+
+AR ~ dnorm(0, 1)T(-1,1)
+tau_noise ~ dgamma(0.001,0.001)
+sd_noise = pow(tau_noise, -1/2)
+
+beta00 ~ dnorm(0, 0.01)
+tau_beta0 ~ dgamma(0.001,0.001)
+sd_beta0 = pow(tau_beta0, -1/2)
+
+tau_int ~ dgamma(0.001,0.001)
+sd_int = pow(tau_int, -1/2)
+
+
+for(kk in 1:2){
+  alpha[kk,2,1] ~ dnorm(0,0.1)
+  alpha[kk,1,1] <- 0
+  alpha[kk,1,2] ~ dnorm(0,0.1)
+  alpha[kk,2,2] <- 0
+}
+
+
+} # end of model
+
