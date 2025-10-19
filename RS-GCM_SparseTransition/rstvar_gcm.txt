@@ -1,0 +1,90 @@
+model{
+for (pp in 1:P) {
+
+## odds: tansition probability matrices 
+## midx: regime indicators
+
+# 1st observation
+odds[pp,1,1] <- 0.9
+odds[pp,1,2] <- 0.1
+
+midx[pp,1]~dcat(odds[pp,1,])
+
+
+Y[pp,1] ~ dnorm(0, 1)
+
+beta0[pp] ~ dnorm(beta00, tau_beta0)
+beta1[pp] ~ dnorm(beta10, tau_beta1)
+intercept[pp,1] = beta0[pp]
+
+AR[pp] ~ dnorm(AR0, tau_AR)T(-1,1)
+
+#gamma[1,pp] ~ dnorm(gamma0[1], tau_gamma[1])
+gamma[1,pp] = 0
+gamma[2,pp] ~ dnorm(gamma0[2], tau_gamma_2)
+
+
+# from T2 to maxT[pp]
+ for (bb in 1:nrPeriod){
+    
+   for(tt in (nrObs[bb]+1):nrObs[bb+1]){
+      	    
+
+# from regime midx[pp,tt-1] to regime 1
+odds[pp,tt,1] <- exp(alpha[1,1,midx[pp,tt-1]]+alpha[2,1,midx[pp,tt-1]]*X[pp,tt]) # remove Period2
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,2] <- exp(alpha[1,2,midx[pp,tt-1]]+alpha[2,2,midx[pp,tt-1]]*X[pp,tt]) # remove Period2
+
+midx[pp,tt]~dcat(odds[pp,tt,])
+
+intercept[pp,tt] = beta0[pp] + beta1[pp]*time[bb]
+
+logIIV[pp,tt] = gamma[midx[pp,tt],pp] 
+Y[pp,tt] ~ dnorm(intercept[pp,tt] + AR[pp] * (Y[pp,tt-1] - intercept[pp,tt-1]), 1/exp(logIIV[pp,tt]))
+
+} # close loop over time points
+
+}
+
+} # close loop over persons
+
+# priors
+# IIV 
+gamma0[1]=0
+#gamma0[1] ~ dnorm(0, 1)
+gamma0[2] = gamma0[1] + shift
+shift ~ dunif(0, 10)
+
+sd_gamma[1] = 0
+tau_gamma_2 ~ dgamma(0.001,0.001)
+sd_gamma[2] = pow(tau_gamma_2, -1/2)
+
+#for(kk in 1:2){
+#tau_gamma[kk] ~ dgamma(0.001,0.001)
+#sd_gamma[kk] = pow(tau_gamma[kk], -1/2)
+#}
+
+# AR
+AR0 ~ dnorm(0,1)T(-1,1)
+tau_AR ~ dgamma(0.001,0.001)
+sd_AR = pow(tau_AR, -1/2)
+
+# Baseline
+beta00 ~ dnorm(0, 0.01)
+tau_beta0 ~ dgamma(0.001,0.001)
+sd_beta0 = pow(tau_beta0, -1/2)
+beta10 ~ dnorm(0, 0.01)
+tau_beta1 ~ dgamma(0.001,0.001)
+sd_beta1 = pow(tau_beta1, -1/2)
+
+# RS model
+for(kk in 1:2){
+  alpha[kk,2,1] ~ dnorm(0,0.1)
+  alpha[kk,1,1] <- 0
+  alpha[kk,1,2] ~ dnorm(0,0.1)
+  alpha[kk,2,2] <- 0
+}
+
+
+} # end of model
+
