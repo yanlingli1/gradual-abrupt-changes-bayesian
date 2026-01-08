@@ -1,0 +1,840 @@
+---
+title: "Simultaneous Detection of Gradual and Abrupt Structural Changes in Bayesian Longitudinal Modelling: A Tutorial"
+subtitle: "Growth Curve Model with 2-Regime Switching (GCM-RS2)"
+author: "Yanling Li, Xiaoyue Xiong, Zita Oravecz & Sy-Miin Chow"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  cache = TRUE,
+  fig.width = 8, 
+  fig.height = 6
+)
+```
+
+# Introduction
+
+This tutorial demonstrates the implementation of the **Growth Curve Model with 2-Regime Switching (GCM-RS2)**, a Bayesian longitudinal model that simultaneously captures gradual changes (via growth curve modeling) and abrupt structural changes (via regime switching). This model is particularly useful for analyzing intensive longitudinal data where both slow developmental trends and sudden state transitions may occur.
+
+## Model Overview
+
+The GCM-RS2 model integrates three key components:
+
+1. **Growth Curve Model (GCM)**: Captures gradual, period-level changes in baseline levels through person-specific intercepts ($\beta_{0i}$) and slopes ($\beta_{1i}$).
+
+2. **Autoregressive (AR) Component**: Models temporal dependencies within individuals, where the current observation depends on deviations from the previous time point.
+
+3. **Regime-Switching (RS) Component**: Allows for abrupt shifts between two latent states (regimes), with transition probabilities governed by covariates.
+
+### Mathematical Formulation
+
+For person $i$ at time $t$ within period $b$, the observation model is:
+
+$$
+Y_{i,t} = \gamma_{S_{i,t},i} + \mu_{i,b} + \phi_i (Y_{i,t-1} - \mu_{i,b} - \gamma_{S_{i,t-1},i}) + \epsilon_{i,t}
+$$
+
+where:
+
+- $\mu_{i,b} = \beta_{0i} + \beta_{1i} \cdot \text{time}_b$ is the baseline level for person $i$ in period $b$
+- $\gamma_{S_{i,t},i}$ is the regime-specific shift (with regime indicator $S_{i,t} \in \{1, 2\}$)
+- $\phi_i$ is the person-specific AR coefficient
+- $\epsilon_{i,t} \sim N(0, \sigma^2_{\epsilon,i})$ is the process noise
+
+> **Note on notation**: In the accompanying code (and this tutorial), we use $\gamma$ to denote the regime-specific shift parameters, which corresponds to $\Delta_{\mu,k}$ in the main paper. Specifically, in the code: `gamma[1]` is fixed at 0 as the reference level (Regime 1), and `gamma[2]` (or equivalently, the `shift` parameter) represents the average shift in baseline when in Regime 2 relative to Regime 1, corresponding to $\Delta_{\mu,2}$ in the paper.
+
+The regime transition follows a first-order Markov process with log-odds:
+
+$$
+\log \frac{P(S_{i,t}=r|S_{i,t-1}=s)}{P(S_{i,t}=s|S_{i,t-1}=s)} = \alpha_{1,r,s} + \alpha_{2,r,s} \cdot \text{Period2}_t \cdot G3_i
+$$
+
+where $G3_i$ is a group indicator and $\text{Period2}_t$ indicates the intervention period.
+
+# Prerequisites
+
+## Required Packages
+
+```{r load-packages}
+# Load required packages
+library(rjags)      # Interface to JAGS for Bayesian modeling
+load.module("dic")  # Load DIC module for model comparison
+library(coda)       # MCMC diagnostics and summaries
+library(ggplot2)    # Visualization
+```
+
+## Post-Processing Functions
+
+The following functions are used for summarizing MCMC output. The `HDIofMCMC` function computes the Highest Density Interval (HDI), and `zcalc` provides comprehensive summary statistics for all monitored parameters.
+
+```{r postcalc-functions}
+#' Compute Highest Density Interval (HDI) from MCMC samples
+#'
+#' @param sampleVec A vector of MCMC samples
+#' @param credMass Credible mass for the interval (default: 0.95)
+#' @return A vector with HDI lower and upper bounds
+HDIofMCMC <- function(sampleVec, credMass = 0.95) {
+  sortedPts <- sort(sampleVec)
+  ciIdxInc <- ceiling(credMass * length(sortedPts))
+  nCIs <- length(sortedPts) - ciIdxInc
+  ciWidth <- rep(0, nCIs)
+  for (i in 1:nCIs) {
+    ciWidth[i] <- sortedPts[i + ciIdxInc] - sortedPts[i]
+  }
+  HDImin <- sortedPts[which.min(ciWidth)]
+  HDImax <- sortedPts[which.min(ciWidth) + ciIdxInc]
+  HDIlim <- c(HDImin, HDImax)
+  return(HDIlim)
+}
+
+#' Comprehensive MCMC Summary Statistics
+#'
+#' @param samples An mcmc.list object from coda.samples()
+#' @param credMass Credible mass for HDI (default: 0.95)
+#' @param CI Quantiles for credible intervals (default: c(.025, .975))
+#' @param delta Not used in current implementation
+#' @param filters Optional character vector to filter parameters by name
+#' @return A data.frame with summary statistics for each parameter
+zcalc <- function(samples, credMass = 0.95, CI = c(.025, .975), 
+                  delta = 0, filters = NULL) {
+  sampleCount <- 1
+  
+  # Ensure samples is a list
+  if (!is.mcmc.list(samples)) {
+    sampleCount <- length(samples)
+  } else {
+    samples <- list(samples)
+  }
+  
+  # Ensure filter is a vector
+  if (!is.null(filters) && !is.vector(filters)) {
+    filters <- c(filters)
+  }
+  
+  # Pre-calculate the number of expected rows
+  rowCount <- 0
+  drops <- list()
+  for (k in 1:sampleCount) {
+    drops[[k]] <- c(0)
+    if (is.null(filters)) {
+      rowCount <- rowCount + nvar(samples[[k]])
+    } else {
+      nvar_k <- nvar(samples[[k]])
+      varnames_k <- varnames(samples[[k]])
+      for (l in 1:nvar_k) {
+        varname <- varnames_k[[l]]
+        isOK <- FALSE
+        for (f in 1:length(filters)) {
+          isOK <- isOK || regexpr(filters[[f]], varname)[1] > 0
+        }
+        if (isOK) {
+          rowCount <- rowCount + 1
+        } else {
+          drops[[k]] <- c(drops[[k]], l)
+        }
+      }
+    }
+  }
+  
+  columnNames <- c()
+  
+  # Pre-allocate the result data frame
+  result <- data.frame(
+    mean = rep(NaN, rowCount),
+    median = rep(NaN, rowCount),
+    mode = rep(NaN, rowCount),
+    sd = rep(NaN, rowCount),
+    hdiLow = rep(NaN, rowCount),
+    hdiHigh = rep(NaN, rowCount),
+    quantileLow = rep(NaN, rowCount),
+    quantileHigh = rep(NaN, rowCount),
+    SS = rep(NaN, rowCount),
+    ESS = rep(NaN, rowCount),
+    RHAT = rep(NaN, rowCount),
+    stringsAsFactors = FALSE
+  )
+  
+  currentRow <- 0
+  
+  # Process each model
+  for (k in 1:sampleCount) {
+    prefix <- ""
+    if (sampleCount > 1) {
+      prefix <- paste(k, ".", sep = "")
+    }
+    
+    sample <- samples[[k]]
+    variables <- nvar(sample)
+    varnames_sample <- varnames(sample)
+    iterations <- niter(sample)
+    chains <- nchain(sample)
+    
+    for (j in 1:variables) {
+      if (!(j %in% drops[[k]])) {
+        currentRow <- currentRow + 1
+        
+        uvalue <- unlist(sample[, j])
+        value <- sample[, j]
+        
+        columnNames <- c(columnNames, paste(prefix, varnames_sample[[j]], sep = ""))
+        
+        result[currentRow, "SS"] <- iterations * chains
+        result[currentRow, "ESS"] <- as.integer(round(effectiveSize(uvalue), 1))
+        result[currentRow, "mean"] <- mean(uvalue)
+        result[currentRow, "median"] <- median(uvalue)
+        
+        mcmcDensity <- density(uvalue)
+        result[currentRow, "mode"] <- mcmcDensity$x[which.max(mcmcDensity$y)]
+        
+        HDI <- HDIofMCMC(uvalue, credMass)
+        result[currentRow, "hdiLow"] <- HDI[1]
+        result[currentRow, "hdiHigh"] <- HDI[2]
+        
+        resultCI <- quantile(uvalue, CI)
+        result[currentRow, "quantileLow"] <- resultCI[1]
+        result[currentRow, "quantileHigh"] <- resultCI[2]
+        
+        result[currentRow, "sd"] <- sd(uvalue)
+        
+        # Gelman-Rubin RHAT calculation
+        chainmeans <- c()
+        chainvars <- c()
+        for (i in 1:chains) {
+          chain_sum <- sum(value[[i]])
+          chain_var <- var(value[[i]])
+          chain_mean <- chain_sum / iterations
+          chainmeans <- c(chainmeans, chain_mean)
+          chainvars <- c(chainvars, chain_var)
+        }
+        globalmean <- sum(chainmeans) / chains
+        globalvar <- sum(chainvars) / chains
+        
+        # Between-chain variance
+        b <- sum((chainmeans - globalmean)^2) * iterations / (chains - 1)
+        
+        # Marginal posterior variance
+        varplus <- (iterations - 1) * globalvar / iterations + b / iterations
+        
+        # Gelman-Rubin statistic
+        rhat <- sqrt(varplus / globalvar)
+        result[currentRow, "RHAT"] <- rhat
+      }
+    }
+  }
+  
+  # Round results
+  result <- data.frame(apply(result, 2, function(x) round(x, 4)))
+  
+  # Rename columns
+  if (length(result) > 0) {
+    names(result)[names(result) == 'hdiLow'] <- paste(sprintf("%.0f", 
+      round(credMass * 100, digits = 2)), "HDI_L", sep = "% ")
+    names(result)[names(result) == 'hdiHigh'] <- paste(sprintf("%.0f", 
+      round(credMass * 100, digits = 2)), "HDI_H", sep = "% ")
+    names(result)[names(result) == 'quantileLow'] <- paste("CrI", 
+      sprintf("%.1f%%", round(CI[1] * 100, digits = 3)), sep = " ")
+    names(result)[names(result) == 'quantileHigh'] <- paste("CrI", 
+      sprintf("%.1f%%", round(CI[2] * 100, digits = 3)), sep = " ")
+  }
+  
+  row.names(result) <- columnNames
+  return(result)
+}
+```
+
+# Part 1: Data Generation
+
+This section describes the data generation process for the GCM-RS2 model. The simulation generates multivariate longitudinal data with both gradual growth trends and regime-switching dynamics.
+
+## Data Generation Function
+
+```{r data-generation-function}
+#' Generate Simulated Data for GCM-RS2 Model
+#'
+#' @param N Number of persons (default: 50)
+#' @param O Number of time points per person (default: 100)
+#' @param shift Magnitude of regime shift (default: 2)
+#' @param seed Random seed for reproducibility
+#' @return A list containing simulated data and true parameter values
+generate_gcm_rs2_data <- function(N = 50, O = 100, shift = 2, seed = 123) {
+  
+  set.seed(seed)
+  
+  # Group indicator: two groups (control vs. intervention)
+  G3 <- c(rep(0, N / 2), rep(1, N / 2))
+  
+  # Time structure: 4 periods
+  time <- 0:3
+  nrPeriod <- length(time)
+  
+  # Period indicator (Period 2 is the intervention period)
+  Period2 <- c(rep(0, O / 4), rep(1, O / 4), rep(0, O / 4), rep(0, O / 4))
+  
+  # Observation indices for each period
+  nrObs <- c(1, seq(O / 4, O, O / 4))
+  
+  # ---- True Parameter Values ----
+  
+  # GCM parameters (baseline)
+  beta00 <- 0           # Population mean intercept
+  sd_beta0 <- 0.2       # SD of random intercepts
+  beta10 <- 0.5         # Population mean slope
+  sd_beta1 <- 0.2       # SD of random slopes
+  
+  # Regime-specific shift parameters (gamma in code corresponds to Δ_μ in paper)
+  # gamma0[1] = 0 is the reference (Regime 1); gamma0[2] = shift corresponds to Δ_{μ,2}
+  gamma0 <- c(0, shift) # Regime 1 fixed at 0; Regime 2 has shift
+  sd_gamma <- c(0, 0.2) # SD of random effects (regime 1 fixed)
+  
+  # AR parameters
+  AR0 <- 0.3            # Population mean AR coefficient
+  sd_AR <- 0.1          # SD of random AR coefficients
+  
+  # Process noise parameters
+  sd_noise0 <- 0.5      # Population mean of process noise SD
+  sd_sd_noise <- 0.1    # SD of process noise SD
+  
+  # Regime-switching parameters (log-odds)
+  alpha <- array(rep(NA, 2 * 2 * 2), dim = c(2, 2, 2))
+  # Fix staying probabilities at 0 (on log-odds scale, reference category)
+  for (i in 1:2) {
+    alpha[i, 1, 1] <- 0
+    alpha[i, 2, 2] <- 0
+  }
+  # Transition parameters
+  alpha[1, 2, 1] <- -0.5  # Baseline log-odds: regime 1 -> regime 2
+  alpha[1, 1, 2] <- -0.5  # Baseline log-odds: regime 2 -> regime 1
+  alpha[2, 2, 1] <- 1     # Effect of G3*Period2 on 1->2 transition
+  alpha[2, 1, 2] <- -1    # Effect of G3*Period2 on 2->1 transition
+  
+  # ---- Initialize Storage Arrays ----
+  
+  odds <- array(rep(NA, N * O * 2), dim = c(N, O, 2))
+  midx <- matrix(NA, N, O)       # Regime indicator
+  p_2s <- matrix(NA, N, O)       # Probability of regime 2
+  
+  Y <- matrix(NA, N, O)          # Observed variable
+  gamma <- matrix(NA, 2, N)      # Person-specific regime effects
+  beta0 <- rep(NA, N)            # Person-specific intercepts
+  beta1 <- rep(NA, N)            # Person-specific slopes
+  AR <- rep(NA, N)               # Person-specific AR coefficients
+  sd_noise <- rep(NA, N)         # Person-specific noise SDs
+  intercept <- matrix(NA, N, nrPeriod)  # Period-specific intercepts
+  
+  # ---- Simulate Data ----
+  
+  for (pp in 1:N) {
+    # Initial regime probabilities (more likely to start in regime 1)
+    odds[pp, 1, 1] <- 0.9
+    odds[pp, 1, 2] <- 0.1
+    p_2s[pp, 1] <- odds[pp, 1, 2] / (odds[pp, 1, 1] + odds[pp, 1, 2])
+    midx[pp, 1] <- sample.int(n = 2, size = 1, prob = odds[pp, 1, ])
+    
+    # Generate person-specific parameters
+    gamma[1, pp] <- rnorm(1, gamma0[1], sd_gamma[1])
+    gamma[2, pp] <- rnorm(1, gamma0[2], sd_gamma[2])
+    beta0[pp] <- rnorm(1, beta00, sd_beta0)
+    beta1[pp] <- rnorm(1, beta10, sd_beta1)
+    AR[pp] <- rnorm(1, AR0, sd_AR)
+    sd_noise[pp] <- rnorm(1, sd_noise0, sd_sd_noise)
+    
+    # Initial observation
+    Y[pp, 1] <- rnorm(1, 0, sd_noise[pp])
+    
+    # Loop over periods and time points
+    for (bb in 1:nrPeriod) {
+      intercept[pp, bb] <- beta0[pp] + beta1[pp] * time[bb]
+      
+      for (oo in (nrObs[bb] + 1):nrObs[bb + 1]) {
+        # Compute transition odds based on covariates
+        # Transition from current regime to regime 1
+        odds[pp, oo, 1] <- exp(alpha[1, 1, midx[pp, oo - 1]] + 
+                                alpha[2, 1, midx[pp, oo - 1]] * Period2[oo] * G3[pp])
+        # Transition from current regime to regime 2
+        odds[pp, oo, 2] <- exp(alpha[1, 2, midx[pp, oo - 1]] + 
+                                alpha[2, 2, midx[pp, oo - 1]] * Period2[oo] * G3[pp])
+        
+        # Sample new regime
+        midx[pp, oo] <- sample.int(n = 2, size = 1, prob = odds[pp, oo, ])
+        p_2s[pp, oo] <- odds[pp, oo, 2] / (odds[pp, oo, 1] + odds[pp, oo, 2])
+        
+        # Generate observation with AR dynamics
+        mu_y <- gamma[midx[pp, oo], pp] + intercept[pp, bb] + 
+                AR[pp] * (Y[pp, oo - 1] - intercept[pp, bb] - gamma[midx[pp, oo - 1], pp])
+        Y[pp, oo] <- rnorm(1, mu_y, sd_noise[pp])
+      }
+    }
+  }
+  
+  # Return all simulated data and true parameters
+  return(list(
+    # Simulated data
+    Y = Y,
+    N = N,
+    O = O,
+    G3 = G3,
+    time = time,
+    nrPeriod = nrPeriod,
+    Period2 = Period2,
+    nrObs = nrObs,
+    midx = midx,
+    
+    # True parameters
+    beta00 = beta00, sd_beta0 = sd_beta0,
+    beta10 = beta10, sd_beta1 = sd_beta1,
+    AR0 = AR0, sd_AR = sd_AR,
+    sd_noise0 = sd_noise0, sd_sd_noise = sd_sd_noise,
+    gamma0 = gamma0, sd_gamma = sd_gamma,
+    alpha = alpha,
+    
+    # Person-level parameters
+    AR = AR, sd_noise = sd_noise,
+    gamma = gamma, beta0 = beta0, beta1 = beta1,
+    intercept = intercept
+  ))
+}
+```
+
+## Generate Sample Data
+
+```{r generate-sample-data}
+# Generate sample data with N=50 persons and T=100 time points
+simdata <- generate_gcm_rs2_data(N = 50, O = 100, shift = 2, seed = 123)
+
+# Display dimensions
+cat("Data dimensions:\n")
+cat("  Number of persons (N):", simdata$N, "\n")
+cat("  Number of time points (O):", simdata$O, "\n")
+cat("  Number of periods:", simdata$nrPeriod, "\n")
+```
+
+## Visualize Simulated Data
+
+```{r visualize-data, fig.cap="Sample trajectories from simulated data. Top: Time series for selected individuals. Bottom: Regime indicators (1 = low, 2 = high)."}
+# Plot sample trajectories
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+# Select a few persons to display
+sample_ids <- c(1, 26)  # One from each group
+
+# Plot time series
+plot(1:simdata$O, simdata$Y[sample_ids[1], ], type = "l", col = "blue",
+     ylim = range(simdata$Y[sample_ids, ]), 
+     xlab = "Time", ylab = "Y", main = "Sample Trajectories")
+lines(1:simdata$O, simdata$Y[sample_ids[2], ], col = "red")
+legend("topright", legend = c("Control (G3=0)", "Intervention (G3=1)"),
+       col = c("blue", "red"), lty = 1, cex = 0.8)
+
+# Add period boundaries
+abline(v = c(25, 50, 75), lty = 2, col = "gray")
+
+# Plot regime indicators
+plot(1:simdata$O, simdata$midx[sample_ids[1], ], type = "s", col = "blue",
+     ylim = c(0.9, 2.1), xlab = "Time", ylab = "Regime", 
+     main = "Regime Indicators", yaxt = "n")
+lines(1:simdata$O, simdata$midx[sample_ids[2], ], type = "s", col = "red")
+axis(2, at = c(1, 2), labels = c("1 (Low)", "2 (High)"))
+abline(v = c(25, 50, 75), lty = 2, col = "gray")
+```
+
+# Part 2: Model Fitting with JAGS
+
+## JAGS Model Specification
+
+The following JAGS model implements the GCM-RS2 framework. The model is saved to a temporary file for use with `jags.model()`.
+
+```{r jags-model-spec}
+# Define JAGS model as a string
+jags_model_string <- "
+model{
+for (pp in 1:P) {
+
+## odds: transition probability matrices 
+## midx: regime indicators
+
+# 1st observation
+odds[pp,1,1] <- 0.9
+odds[pp,1,2] <- 0.1
+
+midx[pp,1] ~ dcat(odds[pp,1,])
+
+Y[pp,1] ~ dnorm(0, 1)
+beta0[pp] ~ dnorm(beta00, tau_beta0)
+beta1[pp] ~ dnorm(beta10, tau_beta1)
+AR[pp] ~ dnorm(AR0, tau_AR)T(-1,1)
+sd_noise[pp] ~ dnorm(sd_noise0, tau_sd_noise)
+tau_noise[pp] = pow(sd_noise[pp], -2)
+gamma[1,pp] = 0
+gamma[2,pp] ~ dnorm(gamma0[2], tau_gamma[2])
+
+
+# from T2 to maxT[pp]
+ for (bb in 1:nrPeriod){
+    
+   intercept[pp,bb] = beta0[pp] + beta1[pp]*time[bb]
+    
+   for(tt in (nrObs[bb]+1):nrObs[bb+1]){
+
+# from regime midx[pp,tt-1] to regime 1
+odds[pp,tt,1] <- exp(alpha[1,1,midx[pp,tt-1]]+alpha[2,1,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,2] <- exp(alpha[1,2,midx[pp,tt-1]]+alpha[2,2,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+
+midx[pp,tt] ~ dcat(odds[pp,tt,])
+
+mus[pp,tt] <- gamma[midx[pp,tt],pp] + intercept[pp,bb] + AR[pp] * (Y[pp,tt-1] - intercept[pp,bb] - gamma[midx[pp,tt-1],pp]) 
+
+Y[pp,tt] ~ dnorm(mus[pp,tt], tau_noise[pp])
+
+
+} # close loop over time points
+
+}
+
+} # close loop over persons
+
+# priors
+gamma0[2] ~ dnorm(0, 0.01)T(0,)
+tau_gamma[2] ~ dgamma(0.001,0.001)
+sd_gamma[2] = pow(tau_gamma[2], -1/2)
+
+AR0 ~ dnorm(0,1)T(-1,1)
+sd_AR ~ dunif(0, 1)
+tau_AR = pow(sd_AR, -2)
+
+sd_noise0 ~ dunif(0, 1)
+sd_sd_noise ~ dunif(0, 1)
+tau_sd_noise = pow(sd_sd_noise, -2)
+
+beta00 ~ dnorm(0, 0.01)
+tau_beta0 ~ dgamma(0.001,0.001)
+sd_beta0 = pow(tau_beta0, -1/2)
+beta10 ~ dnorm(0, 0.01)
+tau_beta1 ~ dgamma(0.001,0.001)
+sd_beta1 = pow(tau_beta1, -1/2)
+
+for(kk in 1:2){
+  alpha[kk,2,1] ~ dnorm(0,0.1)
+  alpha[kk,1,1] <- 0
+  alpha[kk,1,2] ~ dnorm(0,0.1)
+  alpha[kk,2,2] <- 0
+}
+
+
+} # end of model
+"
+
+# Write model to a temporary file
+model_file <- tempfile(fileext = ".txt")
+writeLines(jags_model_string, model_file)
+cat("JAGS model saved to:", model_file, "\n")
+```
+
+## Prepare Data for JAGS
+
+```{r prepare-jags-data}
+# Prepare data list for JAGS
+jags_data <- list(
+  Y = simdata$Y, 
+  P = simdata$N,
+  maxT = simdata$O,
+  Period2 = simdata$Period2,
+  time = simdata$time, 
+  nrObs = simdata$nrObs,
+  nrPeriod = simdata$nrPeriod,
+  G3 = simdata$G3
+)
+
+# Display data structure
+str(jags_data)
+```
+
+## MCMC Settings
+
+```{r mcmc-settings}
+# Fixed initial values for reproducibility
+fixedinits <- list(
+  list(.RNG.seed = 1, .RNG.name = "base::Mersenne-Twister"),
+  list(.RNG.seed = 2, .RNG.name = "base::Mersenne-Twister")
+)
+
+# MCMC settings
+n_chains <- 2        # Number of MCMC chains
+n_adapt <- 4000      # Adaptation iterations
+n_burnin <- 1000     # Burn-in iterations
+n_iter <- 20000      # Sampling iterations
+
+# Parameters to monitor
+parameterlist <- c(
+  "beta00", "sd_beta0",         # GCM intercept parameters
+  "beta10", "sd_beta1",         # GCM slope parameters
+  "AR0", "sd_AR",               # AR parameters
+  "sd_noise0", "sd_sd_noise",   # Process noise parameters
+  "gamma0", "sd_gamma",         # Regime shift parameters
+  "AR", "sd_noise",             # Person-specific parameters
+  "alpha",                      # Transition parameters
+  "midx",                       # Regime indicators
+  "deviance"                    # Model fit
+)
+```
+
+## Run JAGS Model
+
+```{r run-jags, results='hide'}
+# Initialize JAGS model
+cat("Initializing JAGS model...\n")
+jagsModel <- jags.model(
+  file = model_file, 
+  data = jags_data, 
+  inits = fixedinits, 
+  n.chains = n_chains, 
+  n.adapt = n_adapt
+)
+
+# Burn-in period
+cat("Running burn-in (", n_burnin, " iterations)...\n", sep = "")
+update(jagsModel, n.iter = n_burnin)
+
+# Sample from posterior
+cat("Sampling from posterior (", n_iter, " iterations)...\n", sep = "")
+codaSamples <- coda.samples(
+  jagsModel, 
+  variable.names = parameterlist,
+  n.iter = n_iter
+)
+
+cat("MCMC sampling complete.\n")
+```
+
+# Part 3: Post-Analysis
+
+## Generate Summary Table
+
+```{r summary-table}
+# Generate comprehensive summary using zcalc
+resulttable <- zcalc(codaSamples)
+
+# Display fixed-effect parameters
+fixed_params <- c("beta00", "sd_beta0", "beta10", "sd_beta1",
+                  "AR0", "sd_AR", "sd_noise0", "sd_sd_noise",
+                  "gamma0[2]", "sd_gamma[2]",
+                  "alpha[1,2,1]", "alpha[2,2,1]", 
+                  "alpha[1,1,2]", "alpha[2,1,2]")
+
+# Extract rows for fixed parameters
+fixed_rows <- resulttable[rownames(resulttable) %in% fixed_params, ]
+
+cat("\n=== Fixed-Effect Parameter Estimates ===\n")
+print(fixed_rows[, c("mean", "sd", "95% HDI_L", "95% HDI_H", "ESS", "RHAT")])
+```
+
+## Parameter Recovery Assessment
+
+```{r parameter-recovery}
+# True parameter values
+# Note: gamma0[2] corresponds to Δ_{μ,2} in the paper (regime shift magnitude)
+true_values <- c(
+  beta00 = simdata$beta00,
+  sd_beta0 = simdata$sd_beta0,
+  beta10 = simdata$beta10,
+  sd_beta1 = simdata$sd_beta1,
+  AR0 = simdata$AR0,
+  sd_AR = simdata$sd_AR,
+  sd_noise0 = simdata$sd_noise0,
+  sd_sd_noise = simdata$sd_sd_noise,
+  `gamma0[2]` = simdata$gamma0[2],
+  sd_gamma_2 = simdata$sd_gamma[2],
+  `alpha[1,2,1]` = simdata$alpha[1, 2, 1],
+  `alpha[2,2,1]` = simdata$alpha[2, 2, 1],
+  `alpha[1,1,2]` = simdata$alpha[1, 1, 2],
+  `alpha[2,1,2]` = simdata$alpha[2, 1, 2]
+)
+
+# Create comparison table
+param_names <- names(true_values)
+recovery_table <- data.frame(
+  Parameter = param_names,
+  True = unname(true_values),
+  Estimate = resulttable[match(param_names, rownames(resulttable)), "mean"],
+  SD = resulttable[match(param_names, rownames(resulttable)), "sd"],
+  HDI_Low = resulttable[match(param_names, rownames(resulttable)), "95% HDI_L"],
+  HDI_High = resulttable[match(param_names, rownames(resulttable)), "95% HDI_H"],
+  stringsAsFactors = FALSE
+)
+
+# Calculate bias and coverage
+recovery_table$Bias <- recovery_table$Estimate - recovery_table$True
+recovery_table$Covered <- with(recovery_table, 
+                               True >= HDI_Low & True <= HDI_High)
+
+cat("\n=== Parameter Recovery Summary ===\n")
+print(recovery_table, row.names = FALSE)
+```
+
+## Model Fit and Entropy
+
+This section computes model fit diagnostics including Information Criteria (AIC, BIC, sBIC) and Entropy. Information Criteria are used for model comparison, where lower values indicate better fit. Entropy measures regime classification clarity, ranging from 0 (no separation) to 1 (perfect separation).
+
+```{r model-fit-entropy}
+# Extract regime probabilities from posterior means
+midx_rows <- grep("^midx", rownames(resulttable))
+pr2 <- resulttable[midx_rows, "mean"] - 1  # Probability of regime 2
+pr1 <- 1 - pr2                              # Probability of regime 1
+
+# Calculate entropy
+# E_k = 1 + sum(p*log(p)) / (N*T*log(K))
+# For K=2 regimes
+N <- simdata$N
+O <- simdata$O
+
+entropy <- 1 + (sum(pr2 * log(pr2), na.rm = TRUE) + 
+                sum(pr1 * log(pr1), na.rm = TRUE)) / (N * O * log(2))
+
+# Deviance and Information Criteria
+deviance <- resulttable[grep("deviance", rownames(resulttable)), "mean"]
+
+# Number of parameters (npar) for GCM-RS2 model:
+# Fixed effects: beta00, beta10, AR0, sd_noise0, gamma0[2] = 5
+# Random effect SDs: sd_beta0, sd_beta1, sd_AR, sd_sd_noise, sd_gamma[2] = 5
+# RS log-odds coefficients: alpha[1,2,1], alpha[2,2,1], alpha[1,1,2], alpha[2,1,2] = 4
+# Total: 14 fixed parameters
+npar <- 14
+
+# Calculate IC measures (following Equations 8-10 in the paper)
+# Note: Deviance = -2 * log-likelihood
+AIC <- 2 * npar + deviance
+BIC <- npar * log(N * O) + deviance
+sBIC <- npar * log(N * O * (N * O + 2) / 24) + deviance
+
+cat("\n=== Model Fit Diagnostics ===\n")
+cat("\n--- Information Criteria ---\n")
+cat("AIC:", round(AIC, 2), "\n")
+cat("BIC:", round(BIC, 2), "\n")
+cat("sBIC (sample-size adjusted BIC):", round(sBIC, 2), "\n")
+cat("  Note: Lower values indicate better fit; differences > 2 are meaningful\n")
+
+cat("\n--- Entropy ---\n")
+cat("Entropy:", round(entropy, 4), "\n")
+cat("  (Values closer to 1 indicate clearer regime separation;\n")
+cat("   values > 0.6 are generally considered acceptable for RS models)\n")
+
+cat("\nDeviance:", round(deviance, 2), "\n")
+
+# Create summary table of model fit diagnostics
+fit_summary <- data.frame(
+  Metric = c("AIC", "BIC", "sBIC", "Entropy", "Deviance"),
+  Value = c(round(AIC, 2), round(BIC, 2), round(sBIC, 2), 
+            round(entropy, 4), round(deviance, 2)),
+  Description = c(
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion", 
+    "Sample-size adjusted BIC",
+    "Regime classification clarity (0-1)",
+    "-2 * log-likelihood"
+  )
+)
+
+cat("\n--- Summary Table ---\n")
+print(fit_summary, row.names = FALSE)
+```
+
+## Classification Accuracy
+
+```{r classification-accuracy}
+# Compare estimated vs. true regime indicators
+midx_est <- resulttable[midx_rows, "median"]
+midx_true <- as.vector(simdata$midx)
+
+# Confusion matrix
+TP <- sum(midx_true == 2 & round(midx_est) == 2)
+TN <- sum(midx_true == 1 & round(midx_est) == 1)
+FP <- sum(midx_true == 1 & round(midx_est) == 2)
+FN <- sum(midx_true == 2 & round(midx_est) == 1)
+
+# Calculate metrics
+accuracy <- (TP + TN) / (N * O)
+recall <- TP / (TP + FN)
+precision <- TP / (TP + FP)
+
+cat("\n=== Regime Classification Performance ===\n")
+cat("Accuracy:", round(accuracy, 4), "\n")
+cat("Recall (Sensitivity):", round(recall, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+```
+
+## Convergence Diagnostics
+
+```{r convergence-plot, fig.cap="Trace plots and density plots for key parameters."}
+# Select key parameters for visualization
+key_params <- c("beta00", "beta10", "AR0", "gamma0[2]", "alpha[1,2,1]", "alpha[2,2,1]")
+
+# Extract samples for key parameters
+samples_subset <- codaSamples[, key_params]
+
+# Plot trace and density
+plot(samples_subset)
+```
+
+## RHAT Summary
+
+```{r rhat-summary}
+# Check convergence via RHAT
+max_rhat <- max(resulttable$RHAT, na.rm = TRUE)
+n_high_rhat <- sum(resulttable$RHAT > 1.1, na.rm = TRUE)
+
+cat("\n=== Convergence Summary ===\n")
+cat("Maximum RHAT:", round(max_rhat, 4), "\n")
+cat("Parameters with RHAT > 1.1:", n_high_rhat, "\n")
+
+if (max_rhat < 1.1) {
+  cat("Conclusion: All chains appear to have converged.\n")
+} else {
+  cat("Warning: Some parameters may not have converged. Consider longer runs.\n")
+}
+```
+
+# Summary
+
+This tutorial demonstrated:
+
+1. **Data Generation**: How to simulate data from the GCM-RS2 model with gradual growth trends and regime-switching dynamics.
+
+2. **Model Specification**: The JAGS model syntax implementing the hierarchical structure with person-specific parameters and regime transitions.
+
+3. **Model Fitting**: Using `rjags` to fit the Bayesian model with appropriate MCMC settings.
+   - Adaptation: `r n_adapt` iterations
+   - Burn-in: `r n_burnin` iterations  
+   - Sampling: `r n_iter` iterations per chain
+   - Chains: `r n_chains`
+
+4. **Post-Analysis**: Comprehensive summary statistics including HDIs, effective sample sizes, RHAT convergence diagnostics, entropy measures, and classification accuracy metrics.
+
+The results demonstrate satisfactory parameter recovery and regime classification under the simulated conditions with $N = `r simdata$N`$ and $T = `r simdata$O`$.
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+- Kruschke, J. (2014). *Doing Bayesian data analysis: A tutorial with R, JAGS, and Stan*. Academic Press.
+- Li, Y., Williams, L., Muth, C., Heshmati, S., Chow, S.-M., & Oravecz, Z. (2024). A growth of hierarchical autoregression model for capturing individual differences in changes of dynamic characteristics of psychological processes. *Structural Equation Modeling: A Multidisciplinary Journal*, 32, 1–14.
+- Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. In *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
