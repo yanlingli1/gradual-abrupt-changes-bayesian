@@ -36,11 +36,11 @@ This tutorial demonstrates the implementation of the **Growth Curve Model with 2
 
 The GCM-RS2 model integrates three key components:
 
-1. **Growth Curve Model (GCM)**: Captures gradual, period-level changes in baseline levels through person-specific intercepts ($\beta_{0i}$) and slopes ($\beta_{1i}$).
+1.  **Growth Curve Model (GCM)**: Captures gradual, period-level changes in baseline levels through person-specific intercepts ($\beta_{0i}$) and slopes ($\beta_{1i}$).
 
-2. **Autoregressive (AR) Component**: Models temporal dependencies within individuals, where the current observation depends on deviations from the previous time point.
+2.  **Autoregressive (AR) Component**: Models temporal dependencies within individuals, where the current observation depends on deviations from the previous time point.
 
-3. **Regime-Switching (RS) Component**: Allows for abrupt shifts between two latent states (regimes), with transition probabilities governed by covariates.
+3.  **Regime-Switching (RS) Component**: Allows for abrupt shifts between two latent states (regimes), with transition probabilities governed by covariates.
 
 ### Mathematical Formulation
 
@@ -52,12 +52,17 @@ $$
 
 where:
 
-- $\mu_{i,b} = \beta_{0i} + \beta_{1i} \cdot \text{time}_b$ is the baseline level for person $i$ in period $b$
-- $\gamma_{S_{i,t},i}$ is the regime-specific shift (with regime indicator $S_{i,t} \in \{1, 2\}$)
-- $\phi_i$ is the person-specific AR coefficient
-- $\epsilon_{i,t} \sim N(0, \sigma^2_{\epsilon,i})$ is the process noise
+-   $\mu_{i,b} = \beta_{0i} + \beta_{1i} \cdot \text{time}_b$ is the baseline level for person $i$ in period $b$
+-   $\gamma_{S_{i,t},i}$ is the regime-specific shift (with regime indicator $S_{i,t} \in \{1, 2\}$)
+-   $\phi_i$ is the person-specific AR coefficient
+-   $\epsilon_{i,t} \sim N(0, \sigma^2_{\epsilon,i})$ is the process noise
 
-> **Note on notation**: In the accompanying code (and this tutorial), we use $\gamma$ to denote the regime-specific shift parameters, which corresponds to $\Delta_{\mu,k}$ in the main paper. Specifically, in the code: `gamma[1]` is fixed at 0 as the reference level (Regime 1), and `gamma[2]` (or equivalently, the `shift` parameter) represents the average shift in baseline when in Regime 2 relative to Regime 1, corresponding to $\Delta_{\mu,2}$ in the paper.
+> **Note on notation**: In the accompanying code (and this tutorial), we use the following correspondences with the paper:
+>
+> - `intercept[pp,bb]` ($\mu_{i,b} = \beta_{0i} + \beta_{1i} \cdot time_b$) corresponds to the GCM component of $\mu_{i,t}$ in the paper (Equation 3)
+> - `gamma[k,pp]` corresponds to $\Delta_{\mu,k} + \zeta_{i,\Delta_\mu}$ in the paper—the regime-specific shift plus person-specific random effect (Equation 5)
+> - Specifically, `gamma[1,pp]` = 0 (Regime 1 is the reference level), and `gamma[2,pp]` corresponds to $\Delta_{\mu,2} + \zeta_{i,\Delta_\mu}$ in the paper
+> - `gamma0[2]` represents the population mean of the regime shift, $\Delta_{\mu,2}$
 
 The regime transition follows a first-order Markov process with log-odds:
 
@@ -457,7 +462,194 @@ abline(v = c(25, 50, 75), lty = 2, col = "gray")
 
 ## JAGS Model Specification
 
-The following JAGS model implements the GCM-RS2 framework. The model is saved to a temporary file for use with `jags.model()`.
+The following sections walk through the JAGS model implementation of the GCM-RS2 framework step by step. We break the model into logical components and explain each part in detail.
+
+### Overview of the JAGS Model Structure
+
+The JAGS model consists of several interconnected components:
+
+| Component | Description | Key Parameters |
+|----|----|----|
+| **Initial conditions** | First observation and initial regime | `odds[pp,1,]`, `midx[pp,1]` |
+| **Person-specific parameters** | Random effects for each individual | `beta0[pp]`, `beta1[pp]`, `AR[pp]`, `gamma[,pp]` |
+| **Regime transitions** | Markov switching between regimes | `odds[pp,tt,]`, `midx[pp,tt]`, `alpha` |
+| **Observation model** | How observations are generated | `mus[pp,tt]`, `Y[pp,tt]` |
+| **Priors** | Prior distributions for population parameters | Various hyperparameters |
+
+### Initial Conditions and Person-Specific Parameters
+
+The first code block handles initialization for each person `pp`. At time point 1:
+
+-   **Initial regime probabilities**: We set the probability of starting in Regime 1 to 0.9 and Regime 2 to 0.1
+-   **Initial regime assignment**: `midx[pp,1]` is drawn from a categorical distribution based on these probabilities
+-   **Person-specific parameters**: Each person has their own intercept ($\beta_{0,i}$), slope ($\beta_{1,i}$), AR coefficient ($\phi_i$), process noise ($\sigma_{\epsilon,i}$), and regime shift ($\gamma_{2,i}$)
+
+``` jags
+for (pp in 1:P) {
+
+## odds: transition probability matrices 
+## midx: regime indicators
+
+# 1st observation - Initial regime probabilities
+odds[pp,1,1] <- 0.9    # P(starting in regime 1) = 0.9
+odds[pp,1,2] <- 0.1    # P(starting in regime 2) = 0.1
+
+midx[pp,1] ~ dcat(odds[pp,1,])   # Sample initial regime
+
+Y[pp,1] ~ dnorm(0, 1)   # First observation (standardized)
+
+# Person-specific parameters (random effects)
+beta0[pp] ~ dnorm(beta00, tau_beta0)     # Random intercept
+beta1[pp] ~ dnorm(beta10, tau_beta1)     # Random slope
+AR[pp] ~ dnorm(AR0, tau_AR)T(-1,1)       # AR coefficient (constrained for stationarity)
+sd_noise[pp] ~ dnorm(sd_noise0, tau_sd_noise)  # Process noise SD
+tau_noise[pp] = pow(sd_noise[pp], -2)    # Convert to precision
+
+# Regime-specific shifts (gamma in code = Δ_μ in paper)
+gamma[1,pp] = 0                          # Regime 1: reference level (fixed at 0)
+gamma[2,pp] ~ dnorm(gamma0[2], tau_gamma[2])  # Regime 2: shift relative to regime 1
+```
+
+**Key points about person-specific parameters:**
+
+-   `beta0[pp]` and `beta1[pp]`: Define the GCM trajectory $\mu_{i,b} = \beta_{0,i} + \beta_{1,i} \cdot \text{time}_b$
+-   `AR[pp]`: Truncated at (-1, 1) to ensure stationarity of the AR process
+-   `gamma[1,pp] = 0`: Regime 1 is the reference category (fixed at 0)
+-   `gamma[2,pp]`: The shift when in Regime 2 (corresponds to $\Delta_{\mu,2}$ in the paper)
+
+### Regime Transition Model
+
+The regime transition model is the heart of the RS component. For each time point after the first, we compute the **log-odds of transitioning** between regimes based on:
+
+1.  The **previous regime** `midx[pp,tt-1]`
+2.  The **intervention period** indicator `Period2[tt]`
+3.  The **group membership** `G3[pp]`
+
+The transition probability structure can be represented as a 2×2 matrix of log-odds, where rows indicate the **previous regime** ($S_{i,t-1}$) and columns indicate the **next regime** ($S_{i,t}$):
+
+| Previous → Next | To Regime 1 | To Regime 2 |
+|-----------------|-------------|-------------|
+| **From Regime 1** | 0 (reference) | $\alpha_{1,2,1} + \alpha_{2,2,1} \cdot \text{Period2} \cdot G3$ |
+| **From Regime 2** | $\alpha_{1,1,2} + \alpha_{2,1,2} \cdot \text{Period2} \cdot G3$ | 0 (reference) |
+
+Note that $\alpha_{k,s,s} = 0$ (staying in the same regime) serves as the reference category.
+
+``` jags
+# from T2 to maxT[pp]
+ for (bb in 1:nrPeriod){
+    
+   intercept[pp,bb] = beta0[pp] + beta1[pp]*time[bb]  # GCM baseline for period bb
+    
+   for(tt in (nrObs[bb]+1):nrObs[bb+1]){
+
+# Transition log-odds from previous regime to each regime
+# from regime midx[pp,tt-1] to regime 1
+odds[pp,tt,1] <- exp(alpha[1,1,midx[pp,tt-1]] + alpha[2,1,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+
+# from regime midx[pp,tt-1] to regime 2
+odds[pp,tt,2] <- exp(alpha[1,2,midx[pp,tt-1]] + alpha[2,2,midx[pp,tt-1]]*Period2[tt]*G3[pp])
+
+midx[pp,tt] ~ dcat(odds[pp,tt,])  # Sample current regime
+```
+
+**Understanding the `alpha` parameters:**
+
+-   `alpha[1,r,s]`: **Baseline log-odds** of transitioning from regime `s` to regime `r` (when Period2×G3 = 0)
+-   `alpha[2,r,s]`: **Effect of intervention** (Period2×G3) on the log-odds of transitioning from `s` to `r`
+
+For example: - `alpha[1,2,1] = -0.5`: Baseline log-odds of transitioning from Regime 1 to Regime 2 - `alpha[2,2,1] = 1.0`: The intervention group (G3=1) during the intervention period (Period2=1) has increased log-odds of transitioning from Regime 1 to Regime 2
+
+### Observation Model
+
+The observation model generates the actual data. For each time point, the expected value `mus[pp,tt]` combines:
+
+1.  **Regime-specific shift**: `gamma[midx[pp,tt],pp]` — the current regime's effect
+2.  **GCM baseline**: `intercept[pp,bb]` — the gradual change component
+3.  **AR dynamics**: The AR term captures how the previous deviation from baseline carries forward
+
+$$
+Y_{i,t} = \gamma_{S_{i,t},i} + \mu_{i,b} + \phi_i (Y_{i,t-1} - \mu_{i,b} - \gamma_{S_{i,t-1},i}) + \epsilon_{i,t}
+$$
+
+``` jags
+# Observation model
+mus[pp,tt] <- gamma[midx[pp,tt],pp] +        # Current regime shift
+              intercept[pp,bb] +              # GCM baseline
+              AR[pp] * (Y[pp,tt-1] -          # AR component:
+                        intercept[pp,bb] -    #   previous deviation
+                        gamma[midx[pp,tt-1],pp])  #   from baseline
+
+Y[pp,tt] ~ dnorm(mus[pp,tt], tau_noise[pp])  # Observation with person-specific noise
+
+
+} # close loop over time points
+
+}
+
+} # close loop over persons
+```
+
+### Prior Specifications
+
+The priors section specifies our prior beliefs about the population-level parameters. We use weakly informative priors to allow the data to drive inference while maintaining numerical stability.
+
+``` jags
+# Priors for regime shift parameters
+# gamma0[2] corresponds to Δ_{μ,2} in the paper
+gamma0[2] ~ dnorm(0, 0.01)T(0,)  # Truncated at 0: regime 2 must be HIGHER than regime 1
+tau_gamma[2] ~ dgamma(0.001, 0.001)
+sd_gamma[2] = pow(tau_gamma[2], -1/2)
+```
+
+**Why `T(0,)` for `gamma0[2]`?** This truncation constrains the mean shift to be positive, ensuring Regime 2 represents a "high" state (e.g., elevated baseline) relative to Regime 1. This is an **identification constraint** — without it, the regimes could swap labels across MCMC iterations.
+
+``` jags
+# Priors for AR parameters
+AR0 ~ dnorm(0, 1)T(-1, 1)   # Mean AR, constrained for stationarity
+sd_AR ~ dunif(0, 1)          # SD of random AR effects
+tau_AR = pow(sd_AR, -2)
+
+# Priors for process noise parameters
+sd_noise0 ~ dunif(0, 1)      # Mean process noise SD
+sd_sd_noise ~ dunif(0, 1)    # SD of process noise SD
+tau_sd_noise = pow(sd_sd_noise, -2)
+```
+
+``` jags
+# Priors for GCM parameters (intercept and slope)
+beta00 ~ dnorm(0, 0.01)       # Mean intercept (weak prior, precision = 0.01)
+tau_beta0 ~ dgamma(0.001, 0.001)  # Precision of random intercepts
+sd_beta0 = pow(tau_beta0, -1/2)
+
+beta10 ~ dnorm(0, 0.01)       # Mean slope
+tau_beta1 ~ dgamma(0.001, 0.001)  # Precision of random slopes
+sd_beta1 = pow(tau_beta1, -1/2)
+```
+
+``` jags
+# Priors for regime-switching log-odds coefficients
+for(kk in 1:2){
+  alpha[kk,2,1] ~ dnorm(0, 0.1)  # Log-odds: regime 1 -> regime 2
+  alpha[kk,1,1] <- 0             # Reference: staying in regime 1 (fixed at 0)
+  alpha[kk,1,2] ~ dnorm(0, 0.1)  # Log-odds: regime 2 -> regime 1
+  alpha[kk,2,2] <- 0             # Reference: staying in regime 2 (fixed at 0)
+}
+
+} # end of model
+```
+
+**Summary of identification constraints in the RS component:**
+
+| Parameter       | Value          | Purpose                                 |
+|-----------------|----------------|-----------------------------------------|
+| `alpha[kk,1,1]` | Fixed at 0     | Reference for transitions FROM Regime 1 |
+| `alpha[kk,2,2]` | Fixed at 0     | Reference for transitions FROM Regime 2 |
+| `gamma[1,pp]`   | Fixed at 0     | Regime 1 is the reference level         |
+| `gamma0[2]`     | Truncated \> 0 | Regime 2 is the "high" regime           |
+
+### Complete JAGS Model Code
+
+Now we combine all the components into a single model string:
 
 ```{r jags-model-spec}
 # Define JAGS model as a string
@@ -689,39 +881,155 @@ print(recovery_table, row.names = FALSE)
 
 ## Model Fit and Entropy
 
-This section computes model fit diagnostics including Information Criteria (AIC, BIC, sBIC) and Entropy. Information Criteria are used for model comparison, where lower values indicate better fit. Entropy measures regime classification clarity, ranging from 0 (no separation) to 1 (perfect separation).
+This section computes model fit diagnostics including Information Criteria (AIC, BIC, sBIC) and Entropy.
+
+### Information Criteria
+
+Information Criteria (IC) measures are used for model comparison, balancing goodness-of-fit against model complexity. We compute three commonly used IC measures:
+
+$$
+\text{AIC} = -2\ln(\hat{L}) + 2k
+$$
+
+$$
+\text{BIC} = -2\ln(\hat{L}) + k\ln(n)
+$$
+
+$$
+\text{sBIC} = -2\ln(\hat{L}) + k\ln\left(\frac{n(n+2)}{24}\right)
+$$
+
+where:
+
+-   $\hat{L}$ is the maximum likelihood (or in Bayesian context, we use the deviance $= -2\ln(\hat{L})$)
+-   $k$ is the number of model parameters
+-   $n = N \times T$ is the total number of observations
+
+**Interpretation:**
+
+-   **Lower IC values** indicate better model fit
+-   An IC difference **\> 2** between models is considered meaningful
+-   An IC difference **\> 10** provides strong evidence for the better-fitting model
+
+The three IC measures impose different penalties for complexity:
+
+| Measure | Complexity Penalty   | Tendency                      |
+|---------|----------------------|-------------------------------|
+| AIC     | Lightest ($2k$)      | May favor more complex models |
+| BIC     | Heaviest ($k\ln(n)$) | May favor simpler models      |
+| sBIC    | Moderate             | Compromise for finite samples |
+
+### Entropy
+
+Entropy is a measure of **regime classification clarity** that quantifies how well the model separates observations into distinct regimes. We adopt the entropy definition used in mixture modeling (Asparouhov & Muthén, 2014; Celeux & Soromenho, 1996):
+
+$$
+E_K = 1 + \frac{1}{n \ln(K)} \sum_{i=1}^{N} \sum_{t=1}^{T_i} \sum_{k=1}^{K} \hat{p}_{itk} \ln(\hat{p}_{itk})
+$$
+
+where:
+
+-   $N$ is the number of individuals
+-   $T_i$ is the number of time points for person $i$
+-   $K$ is the number of regimes (K=2 in our case)
+-   $\hat{p}_{itk}$ is the **posterior probability** of person $i$ being in regime $k$ at time $t$
+-   $n = \sum_{i=1}^{N} T_i$ is the total number of observations
+
+For a 2-regime model (K=2), this simplifies to:
+
+$$
+E_2 = 1 + \frac{\sum_{i=1}^{N} \sum_{t=1}^{T} \left[ \hat{p}_{it,2} \ln(\hat{p}_{it,2}) + \hat{p}_{it,1} \ln(\hat{p}_{it,1}) \right]}{N \cdot T \cdot \ln(2)}
+$$
+
+**Why does this formula work?**
+
+The term $\sum p \ln(p)$ is the **negative Shannon entropy**. 
+
+- When all probabilities are either 0 or 1 (perfect classification), $p \ln(p) = 0$ (since $\lim_{p \to 0} p \ln(p) = 0$), giving $E_K = 1$. 
+- When K=2 and all probabilities are 0.5 (maximum uncertainty), each observation contributes $0.5 \ln(0.5) + 0.5 \ln(0.5) = \ln(0.5)$, so: $$E_2 = 1 + \frac{n \cdot \ln(0.5)}{n \cdot \ln(2)} = 1 + \frac{\ln(0.5)}{\ln(2)} = 1 - 1 = 0$$
+
+**Interpretation of entropy values:**
+
+| Entropy Range | Classification Quality                             |
+|---------------|----------------------------------------------------|
+| 0.9 - 1.0     | Excellent separation                               |
+| 0.8 - 0.9     | Good separation                                    |
+| 0.6 - 0.8     | Acceptable for RS models with frequent transitions |
+| \< 0.6        | Poor separation (regimes not well distinguished)   |
+
+**Note:** Conventional thresholds (e.g., > 0.9) developed for cross-sectional mixture models (Celeux & Soromenho, 1996) may be overly stringent for longitudinal RS models with frequent transitions. Our simulation results (see Section 5.4 of Li et al., 2026) suggest that entropy values as low as 0.6 can still yield satisfactory parameter estimation and classification performance. The recommended model selection strategy combines entropy (threshold > 0.6) with IC measures.
 
 ```{r model-fit-entropy}
-# Extract regime probabilities from posterior means
+# ============================================
+# STEP 1: Extract posterior regime probabilities
+# ============================================
+# The JAGS output contains midx[i,t] which represents the regime indicator
+# The posterior mean of midx gives us the expected regime (1 or 2)
+# We convert this to probability of being in regime 2: pr2 = E[midx] - 1
+
 midx_rows <- grep("^midx", rownames(resulttable))
-pr2 <- resulttable[midx_rows, "mean"] - 1  # Probability of regime 2
-pr1 <- 1 - pr2                              # Probability of regime 1
+pr2 <- resulttable[midx_rows, "mean"] - 1  # Posterior probability of regime 2
+pr1 <- 1 - pr2                              # Probability of regime 1 (complement)
 
-# Calculate entropy
-# E_k = 1 + sum(p*log(p)) / (N*T*log(K))
-# For K=2 regimes
-N <- simdata$N
-O <- simdata$O
+# ============================================
+# STEP 2: Calculate Entropy
+# ============================================
+# Formula: E_K = 1 + sum(p*log(p)) / (N*T*log(K))
+# For K=2: E_2 = 1 + [sum(pr1*log(pr1)) + sum(pr2*log(pr2))] / (N*T*log(2))
+#
+# Note: 0*log(0) is defined as 0 (using na.rm=TRUE handles this)
 
+N <- simdata$N  # Number of persons
+O <- simdata$O  # Number of time points
+
+# Calculate entropy using the formula from the paper
 entropy <- 1 + (sum(pr2 * log(pr2), na.rm = TRUE) + 
                 sum(pr1 * log(pr1), na.rm = TRUE)) / (N * O * log(2))
 
-# Deviance and Information Criteria
+# ============================================
+# STEP 3: Calculate Information Criteria
+# ============================================
+# Extract deviance from JAGS output (deviance = -2 * log-likelihood)
 deviance <- resulttable[grep("deviance", rownames(resulttable)), "mean"]
 
-# Number of parameters (npar) for GCM-RS2 model:
-# Fixed effects: beta00, beta10, AR0, sd_noise0, gamma0[2] = 5
-# Random effect SDs: sd_beta0, sd_beta1, sd_AR, sd_sd_noise, sd_gamma[2] = 5
-# RS log-odds coefficients: alpha[1,2,1], alpha[2,2,1], alpha[1,1,2], alpha[2,1,2] = 4
-# Total: 14 fixed parameters
+# Count the number of estimated parameters (npar) for GCM-RS2 model:
+# 
+# Population-level fixed effects:
+#   - GCM: beta00, beta10 = 2
+#   - AR: AR0 = 1
+#   - Process noise: sd_noise0 = 1
+#   - Regime shift: gamma0[2] = 1 (gamma0[1] is fixed at 0)
+#   Subtotal: 5
+#
+# Random effect standard deviations:
+#   - GCM: sd_beta0, sd_beta1 = 2
+#   - AR: sd_AR = 1
+#   - Process noise: sd_sd_noise = 1
+#   - Regime shift: sd_gamma[2] = 1 (sd_gamma[1] is 0)
+#   Subtotal: 5
+#
+# RS transition log-odds coefficients:
+#   - alpha[1,2,1]: baseline log-odds of 1->2 = 1
+#   - alpha[2,2,1]: intervention effect on 1->2 = 1
+#   - alpha[1,1,2]: baseline log-odds of 2->1 = 1
+#   - alpha[2,1,2]: intervention effect on 2->1 = 1
+#   (alpha[k,1,1] and alpha[k,2,2] are fixed at 0)
+#   Subtotal: 4
+#
+# Total: 5 + 5 + 4 = 14 parameters
 npar <- 14
 
-# Calculate IC measures (following Equations 8-10 in the paper)
-# Note: Deviance = -2 * log-likelihood
-AIC <- 2 * npar + deviance
-BIC <- npar * log(N * O) + deviance
-sBIC <- npar * log(N * O * (N * O + 2) / 24) + deviance
+# Calculate IC measures using formulas from the paper (Equations 8-10)
+# Note: In Bayesian context, we use posterior mean deviance
+n_total <- N * O  # Total number of observations
 
+AIC <- 2 * npar + deviance                           # Equation 8
+BIC <- npar * log(n_total) + deviance                # Equation 9
+sBIC <- npar * log(n_total * (n_total + 2) / 24) + deviance  # Equation 10
+
+# ============================================
+# STEP 4: Display Results
+# ============================================
 cat("\n=== Model Fit Diagnostics ===\n")
 cat("\n--- Information Criteria ---\n")
 cat("AIC:", round(AIC, 2), "\n")
@@ -742,9 +1050,9 @@ fit_summary <- data.frame(
   Value = c(round(AIC, 2), round(BIC, 2), round(sBIC, 2), 
             round(entropy, 4), round(deviance, 2)),
   Description = c(
-    "Akaike Information Criterion",
-    "Bayesian Information Criterion", 
-    "Sample-size adjusted BIC",
+    "Akaike Information Criterion (Eq. 8)",
+    "Bayesian Information Criterion (Eq. 9)", 
+    "Sample-size adjusted BIC (Eq. 10)",
     "Regime classification clarity (0-1)",
     "-2 * log-likelihood"
   )
@@ -813,19 +1121,20 @@ if (max_rhat < 1.1) {
 
 This tutorial demonstrated:
 
-1. **Data Generation**: How to simulate data from the GCM-RS2 model with gradual growth trends and regime-switching dynamics.
+1.  **Data Generation**: How to simulate data from the GCM-RS2 model with gradual growth trends and regime-switching dynamics.
 
-2. **Model Specification**: The JAGS model syntax implementing the hierarchical structure with person-specific parameters and regime transitions.
+2.  **Model Specification**: The JAGS model syntax implementing the hierarchical structure with person-specific parameters and regime transitions.
 
-3. **Model Fitting**: Using `rjags` to fit the Bayesian model with appropriate MCMC settings.
-   - Adaptation: `r n_adapt` iterations
-   - Burn-in: `r n_burnin` iterations  
-   - Sampling: `r n_iter` iterations per chain
-   - Chains: `r n_chains`
+3.  **Model Fitting**: Using `rjags` to fit the Bayesian model with appropriate MCMC settings.
 
-4. **Post-Analysis**: Comprehensive summary statistics including HDIs, effective sample sizes, RHAT convergence diagnostics, entropy measures, and classification accuracy metrics.
+    -   Adaptation: `r n_adapt` iterations
+    -   Burn-in: `r n_burnin` iterations\
+    -   Sampling: `r n_iter` iterations per chain
+    -   Chains: `r n_chains`
 
-The results demonstrate satisfactory parameter recovery and regime classification under the simulated conditions with $N = `r simdata$N`$ and $T = `r simdata$O`$.
+4.  **Post-Analysis**: Comprehensive summary statistics including HDIs, effective sample sizes, RHAT convergence diagnostics, entropy measures, and classification accuracy metrics.
+
+The results demonstrate satisfactory parameter recovery and regime classification under the simulated conditions with $N = `r simdata$N`$ and $T =`r simdata$O`$.
 
 # Session Information
 
@@ -835,6 +1144,9 @@ sessionInfo()
 
 # References
 
-- Kruschke, J. (2014). *Doing Bayesian data analysis: A tutorial with R, JAGS, and Stan*. Academic Press.
-- Li, Y., Williams, L., Muth, C., Heshmati, S., Chow, S.-M., & Oravecz, Z. (2024). A growth of hierarchical autoregression model for capturing individual differences in changes of dynamic characteristics of psychological processes. *Structural Equation Modeling: A Multidisciplinary Journal*, 32, 1–14.
-- Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. In *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
+-   Asparouhov, T., & Muthén, B. (2014). Variable-specific entropy contribution. Retrieved from http://www.statmodel.com/download/UnivariateEntropy.pdf
+-   Celeux, G., & Soromenho, G. (1996). An entropy criterion for assessing the number of clusters in a mixture model. *Journal of Classification*, 13, 195–212.
+-   Kruschke, J. (2014). *Doing Bayesian data analysis: A tutorial with R, JAGS, and Stan*. Academic Press.
+-   Li, Y., Xiong, X., Oravecz, Z., & Chow, S.-M. (2026). Simultaneous detection of gradual and abrupt structural changes in Bayesian longitudinal modelling. *British Journal of Mathematical and Statistical Psychology*.
+-   Li, Y., Williams, L., Muth, C., Heshmati, S., Chow, S.-M., & Oravecz, Z. (2024). A growth of hierarchical autoregression model for capturing individual differences in changes of dynamic characteristics of psychological processes. *Structural Equation Modeling: A Multidisciplinary Journal*, 32, 1–14.
+-   Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. In *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
